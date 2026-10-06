@@ -80,11 +80,15 @@ class ZoneRef(BaseModel):
     version: int = Field(ge=1)
 
 
-class ReviewRequest(BaseModel):
+class ReviewParamsBase(BaseModel):
+    """审查参数基类：禁区版本引用、初始刀尖、刀半径、可选净间隙/多刀。
+
+    POST /reviews 与分块上传会话创建（POST /uploads）共用同一套校验，
+    保证两种提交方式的审查口径完全一致。
+    """
     zones: list[ZoneRef] = Field(min_length=1)
     start: tuple[float, float, float]
     tool_radius: float = Field(ge=0.0)
-    gcode: str = Field(min_length=1)
     # 可选：启用后计算全程最小水平净间隙并随报告固化
     include_min_clearance: bool = False
     # 可选：多刀模式。非负整数刀号 -> 非负有限毫米半径。
@@ -146,6 +150,10 @@ class ReviewRequest(BaseModel):
         for c in v:
             _finite(c, "初始刀尖坐标")
         return tuple(float(c) for c in v)  # type: ignore[return-value]
+
+
+class ReviewRequest(ReviewParamsBase):
+    gcode: str = Field(min_length=1)
 
 
 class MinClearanceOut(BaseModel):
@@ -260,3 +268,56 @@ class BatchReviewResponse(BaseModel):
     batch_id: str
     item_count: int
     results: list[BatchItemResult]
+
+
+# ---------- 长 G-code 可恢复分块上传 ----------
+
+# 单块上限 64 KiB；会话总量上限 8 MiB；每块至少 1 字节 => 块数/序号上界
+MAX_CHUNK_BYTES = 64 * 1024
+MAX_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_CHUNK_COUNT = MAX_TOTAL_BYTES
+
+
+class UploadSessionCreate(ReviewParamsBase):
+    """创建分块上传会话：冻结审查参数（同 POST /reviews，缺 gcode）。
+
+    禁区编号 + 明确版本、初始刀尖坐标、刀半径与可选多刀/最小净间隙
+    设置在创建时固定并落库；G-code 随后以分块方式提交。
+    """
+
+
+class UploadSessionOut(BaseModel):
+    """上传会话状态：可查询已收序号、累计量与完成结果。"""
+    session_id: str
+    status: Literal["open", "completed"]
+    # 创建时冻结的审查参数（与 POST /reviews 同形，缺 gcode）
+    params: dict[str, Any]
+    # 已收块序号（升序）与累计统计
+    received_seqs: list[int]
+    received_count: int
+    total_bytes: int
+    max_chunk_bytes: int
+    max_total_bytes: int
+    # 完成声明与结果（未完成时为 null）
+    declared_chunk_count: int | None
+    declared_sha256: str | None
+    report_id: int | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class ChunkReceipt(BaseModel):
+    """块回执：同号同内容重传返回同一回执（内容不变，天然幂等）。"""
+    session_id: str
+    seq: int
+    byte_len: int
+    sha256: str = Field(description="块内容（原始字节）的 SHA-256，小写 hex")
+
+
+class UploadCompleteRequest(BaseModel):
+    """完成声明：正整数块数 + 拼接后文本（UTF-8 字节）的 SHA-256。"""
+    chunk_count: int = Field(ge=1, le=MAX_CHUNK_COUNT,
+                             description="正整数块数：块 0..chunk_count-1 参与拼接")
+    sha256: str = Field(min_length=64, max_length=64,
+                        pattern=r"^[0-9a-fA-F]{64}$",
+                        description="拼接后文本的 SHA-256（hex，大小写均可）")

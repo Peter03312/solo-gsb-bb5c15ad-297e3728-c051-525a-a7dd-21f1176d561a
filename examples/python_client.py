@@ -249,6 +249,102 @@ def main() -> None:
         print("  failed item:", f["index"], f["task_id"], f["error"])
     assert [f["task_id"] for f in err["failed_items"]] == ["bad-gcode"]
 
+    # 12. 长 G-code 可恢复分块上传（/uploads）：车间网络不稳时
+    #     先创建会话冻结审查参数，再以 0 起序号乱序提交 UTF-8 文本块
+    #     （单块 <= 64 KiB、总量 <= 8 MiB），最后声明块数与整文 SHA-256
+    #     完成；完成结果与 POST /reviews 同口径，行号按拼接原文计算。
+    import hashlib
+
+    full = "G21 G90 G17\nG1 X15 Y5 Z0\n"
+    parts = ["G21 G90 G17\n", "G1 X1", "5 Y5 Z0\n"]  # 块边界可切在行中间
+    sess = c.post("/uploads", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 5.0, 0.0],
+        "tool_radius": 0.5,
+        "include_min_clearance": True,
+    })
+    sess.raise_for_status()  # 201
+    sid = sess.json()["session_id"]
+    print("upload session:", sid)
+
+    receipts = {}
+    for seq in (1, 2, 0):  # 乱序到达
+        r = c.put(f"/uploads/{sid}/chunks/{seq}",
+                  content=parts[seq].encode("utf-8"))
+        r.raise_for_status()  # 201
+        receipts[seq] = r.json()
+        assert receipts[seq]["sha256"] == hashlib.sha256(
+            parts[seq].encode("utf-8")).hexdigest()
+
+    # 断网重传：同号同内容 => 200 返回原回执；同号异内容 => 409 不覆盖
+    again = c.put(f"/uploads/{sid}/chunks/1",
+                  content=parts[1].encode("utf-8"))
+    assert again.status_code == 200 and again.json() == receipts[1]
+    conflict = c.put(f"/uploads/{sid}/chunks/1", content=b"G1 X9")
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["error"] == "chunk_conflict"
+
+    # 查询已收序号（断点续传依据）
+    st = c.get(f"/uploads/{sid}").json()
+    assert st["received_seqs"] == [0, 1, 2]
+    assert st["total_bytes"] == len(full.encode("utf-8"))
+
+    # 完成：声明正整数块数与拼接文本 SHA-256 => 201 生成不可变报告
+    done = c.post(f"/uploads/{sid}/complete", json={
+        "chunk_count": 3,
+        "sha256": hashlib.sha256(full.encode("utf-8")).hexdigest(),
+    })
+    done.raise_for_status()  # 201
+    body = done.json()
+    print("upload complete: report", body["report_id"],
+          body["conclusion"], "line", body["collision_line_no"])
+    assert body["has_collision"] and body["collision_line_no"] == 2
+    # 与单项审查同口径（除 report_id 外结果一致）
+    direct = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 5.0, 0.0], "tool_radius": 0.5,
+        "gcode": full, "include_min_clearance": True,
+    }).json()
+    for k in ("has_collision", "collision_line_no", "collision_zone_no",
+              "conclusion", "message", "min_clearance"):
+        assert body[k] == direct[k], k
+    # 报告可回看且不可变
+    assert c.get(f"/reports/{body['report_id']}").json()[
+        "collision_line_no"] == 2
+
+    # 相同完成声明重放/并发 => 同一报告（200）；不同声明 => 409；
+    # 成功完成后拒绝新块（409），同号同内容重传仍返回原回执
+    replay = c.post(f"/uploads/{sid}/complete", json={
+        "chunk_count": 3,
+        "sha256": hashlib.sha256(full.encode("utf-8")).hexdigest(),
+    })
+    assert replay.status_code == 200
+    assert replay.json()["report_id"] == body["report_id"]
+    other = c.post(f"/uploads/{sid}/complete",
+                   json={"chunk_count": 3, "sha256": "0" * 64})
+    assert other.status_code == 409
+    assert other.json()["detail"]["error"] == "completion_conflict"
+    assert c.put(f"/uploads/{sid}/chunks/3",
+                 content=b"G1 X0\n").status_code == 409
+    assert c.put(f"/uploads/{sid}/chunks/1",
+                 content=parts[1].encode("utf-8")).status_code == 200
+
+    # 缺块/摘要不符/解析失败 => 409/422 且不留报告，会话保持 open 可修正
+    sess2 = c.post("/uploads", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 50.0, 0.0], "tool_radius": 0.0,
+    }).json()["session_id"]
+    c.put(f"/uploads/{sess2}/chunks/0", content=b"G1 X15 Y50 Z0\n")
+    missing = c.post(f"/uploads/{sess2}/complete", json={
+        "chunk_count": 2,
+        "sha256": hashlib.sha256(b"G1 X15 Y50 Z0\n").hexdigest(),
+    })
+    assert missing.status_code == 409
+    assert missing.json()["detail"]["error"] == "incomplete_upload"
+    assert missing.json()["detail"]["missing_seqs"] == [1]
+    print("incomplete upload rejected, session stays open:",
+          c.get(f"/uploads/{sess2}").json()["status"])
+
 
 if __name__ == "__main__":
     main()

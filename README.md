@@ -40,6 +40,15 @@
   G-code 及可选最小净间隙/多刀参数；**同一事务**中先校验整批并固定各项禁区版本快照，
   任一项非法返回**逐项错误**且整批不落报告，全部通过才按输入顺序生成不可变报告；
   相同 `batch_id` 重放按内容判定幂等/冲突；
+- **长 G-code 可恢复分块上传**（`/uploads`，见下文「分块上传审查」）：车间网络不稳时
+  先创建上传会话（**固定禁区编号及明确版本**、初始刀尖坐标、刀半径与可选多刀/
+  最小净间隙设置，返回会话标识），再以 **0 起序号**乱序提交 UTF-8 文本块
+  （单块 ≤ 64 KiB、会话总量 ≤ 8 MiB；可查询已收序号；**同号同内容重传返回原回执**、
+  同号异内容冲突不覆盖）；完成时声明**正整数块数**与**拼接文本 SHA-256**，
+  仅在 0..块数-1 齐全、摘要一致且整份 G-code 通过既有审查校验时，
+  按与 `POST /reviews` **完全相同的口径**生成一份不可变报告（行号按拼接原文）；
+  相同完成声明并发/重放返回**同一报告**，成功完成后不同声明冲突且拒绝新块；
+  全部状态落库，**跨服务重启保留**；
 - 报告**一旦生成不可变**，后续禁区更新新版本不影响任何旧报告；
 - 非法几何、负/非法刀具半径、非法圆弧、不支持的运动/坐标系指令、非法开关类型，以及多刀模式下
   非整数/负数 `T`、同行多个 `T`、未映射刀号、非法映射半径一律返回 `422`，**不留任何报告**。
@@ -63,7 +72,8 @@ docker compose up --build
 对**升级前的旧库**会幂等补齐 `reports` 表的最小净间隙列（`ALTER TABLE ... ADD COLUMN`），
 v1.2 的多刀命中刀号/半径列（`collision_tool_no` / `collision_tool_radius`），
 以及 v1.3 的执行事件轨迹列（`execution_trace`）；v1.4 新增的 `batches` 批量审查表
-由 `create_all` 对旧库幂等建出。
+与 v1.5 新增的 `upload_sessions` / `upload_chunks` 分块上传表
+均由 `create_all` 对旧库幂等建出。
 旧报告读取为 `min_clearance_enabled=false`、`min_clearance=null`，多刀字段为 `null`，
 `execution_trace=null`，旧请求行为不变。
 
@@ -376,7 +386,130 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
   （`batch_conflict`）且不生成新报告。内容按逐项规范化请求计算 SHA-256 判定；
   并发同 `batch_id` 由数据库唯一约束兜底，结果一致。
 
-### 8. 查询报告（不可变）
+### 8. 长 G-code 可恢复分块上传（`/uploads`，v1.5）
+
+车间网络不稳时，长 G-code 不必一次性提交：先建会话冻结审查参数，再分块乱序上传，
+断网恢复后按已收序号续传，最后声明块数与整文摘要完成审查。
+全部状态落库（`upload_sessions` / `upload_chunks`），**跨服务重启保留**。
+
+#### 8.1 创建上传会话
+
+`POST /uploads`
+
+请求体与 `POST /reviews` 相同但**不含 `gcode`**（禁区编号 + 明确版本、初始刀尖坐标、
+刀半径、可选 `include_min_clearance` / `tool_radii`，校验口径一致）：
+
+```json
+{
+  "zones": [{"zone_no": 1, "version": 1}],
+  "start": [-5.0, 5.0, 0.0],
+  "tool_radius": 0.5,
+  "include_min_clearance": true,
+  "tool_radii": {"2": 2.0}
+}
+```
+
+创建时即校验禁区编号与明确版本存在（404/422 同 `/reviews`），参数**冻结**随会话落库
+（随后禁区再出新版本不影响本会话，完成时仍按固定的明确版本审查）。
+返回 `201` 与会话标识及上限：
+
+```json
+{
+  "session_id": "7ace31c6448f48e4afc2de15b12aed19",
+  "status": "open",
+  "params": {"zones": [{"zone_no": 1, "version": 1}], "...": "..."},
+  "received_seqs": [],
+  "received_count": 0,
+  "total_bytes": 0,
+  "max_chunk_bytes": 65536,
+  "max_total_bytes": 8388608,
+  "declared_chunk_count": null,
+  "declared_sha256": null,
+  "report_id": null,
+  "created_at": "...", "completed_at": null
+}
+```
+
+#### 8.2 提交文本块（0 起序号，可乱序）
+
+`PUT /uploads/{session_id}/chunks/{seq}`
+
+- 请求体为**原始 UTF-8 文本块**（`Content-Type` 不限，建议 `text/plain; charset=utf-8`
+  或 `application/octet-stream`）；块边界可以切在任意字符边界（含行中间），
+  行号最终按**拼接后的原文**计算；
+- `seq` 为 **0 起的整数**（上界 8388607）；块可**乱序**到达；
+- **单块 1 字节～64 KiB**（空块 `422 empty_chunk`，超限 `413 chunk_too_large`）；
+  **会话总量 ≤ 8 MiB**（超限 `413 total_size_exceeded`，该块不入库）；
+- 非 UTF-8 内容 `422 invalid_encoding`；
+- 新块入库返回 `201` 回执；**同号同内容重传**返回 `200` 与**原回执**（幂等，
+  计数不重复）；**同号异内容**返回 `409 chunk_conflict` 且**不覆盖**原块：
+
+```json
+{"session_id": "...", "seq": 1, "byte_len": 5,
+ "sha256": "6f1febdda7724a284d20ad4d8aae10a06668013b9eaeebe98608d9945ef6e427"}
+```
+
+#### 8.3 查询会话与已收序号
+
+`GET /uploads/{session_id}`
+
+返回 8.1 同形状态：`received_seqs`（已收序号升序，断点续传依据）、
+`received_count` / `total_bytes`、完成后的 `declared_chunk_count` /
+`declared_sha256` / `report_id` 等。
+
+#### 8.4 完成上传（声明块数 + 整文 SHA-256）
+
+`POST /uploads/{session_id}/complete`
+
+```json
+{"chunk_count": 3,
+ "sha256": "c80c5d4af928519d2166d01d80de689bae4a65f484ac306837404f53adef553f"}
+```
+
+- `chunk_count` 为**正整数**（≤ 8388608）；`sha256` 为**拼接后文本**（块 0..块数-1
+  按序拼接的 UTF-8 字节）的 SHA-256，64 位 hex（大小写均可）；
+- **仅在** 0..块数-1 齐全、无越界块（序号 ≥ 块数的已上传块）、摘要一致、
+  且整份 G-code 通过既有审查校验时，按与 `POST /reviews` **完全相同的口径**
+  生成一份不可变报告，返回 `201` 与完整审查结果（含 `report_id`，
+  可继续 `GET /reports/{report_id}` 回看）；
+- **相同完成声明**（块数 + 摘要均一致）并发或重放返回 `200` 与**同一报告**
+  （响应与首次一致，不生成新报告）；成功完成后**不同声明**返回
+  `409 completion_conflict`，**新块**返回 `409 session_completed`
+  （同号同内容重传仍返回原回执）；
+- 以下失败均**不留报告**、会话保持 `open`（可修正后重新完成）：
+
+| 情形 | 状态码 | `detail.error` |
+| --- | --- | --- |
+| 缺块（0..块数-1 未齐全） | 409 | `incomplete_upload`（含 `missing_seqs`/`missing_count`） |
+| 存在序号 ≥ 块数的越界块 | 409 | `unexpected_chunks`（含 `extra_seqs`/`extra_count`） |
+| 拼接文本摘要与声明不符 | 409 | `digest_mismatch`（含实际摘要） |
+| G-code 解析/参数非法 | 422 | 与 `/reviews` 同形（如 `invalid_gcode`，含行号） |
+| 块数/摘要格式非法 | 422 | 请求校验错误 |
+
+#### 8.5 完整流程示例
+
+```bash
+# 1) 创建会话（冻结审查参数）
+SID=$(curl -s -X POST http://localhost:8080/uploads \
+  -H 'Content-Type: application/json' \
+  -d '{"zones":[{"zone_no":1,"version":1}],"start":[-5,5,0],
+       "tool_radius":0.5,"include_min_clearance":true}' \
+  | sed -n 's/.*"session_id":"\([0-9a-f]*\)".*/\1/p')
+
+# 2) 乱序分块上传（断网后重传同号块安全幂等）
+printf 'G21 G90 G17\n' | curl -s -X PUT "http://localhost:8080/uploads/$SID/chunks/0" --data-binary @-
+printf 'G1 X1'         | curl -s -X PUT "http://localhost:8080/uploads/$SID/chunks/1" --data-binary @-
+printf '5 Y5 Z0\n'     | curl -s -X PUT "http://localhost:8080/uploads/$SID/chunks/2" --data-binary @-
+
+# 3) 查询已收序号，确认齐全后完成
+curl -s "http://localhost:8080/uploads/$SID"
+DIGEST=$(printf 'G21 G90 G17\nG1 X15 Y5 Z0\n' | sha256sum | cut -d' ' -f1)
+curl -s -X POST "http://localhost:8080/uploads/$SID/complete" \
+  -H 'Content-Type: application/json' \
+  -d "{\"chunk_count\": 3, \"sha256\": \"$DIGEST\"}"
+```
+
+### 9. 查询报告（不可变）
 
 `GET /reports/{report_id}`
 
@@ -435,9 +568,10 @@ curl -s -X POST http://localhost:8080/reviews \
 
 ```
 app/
-  main.py        # FastAPI 路由：禁区/版本/审查/批量审查/报告
-  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹与批量输出）
-  models.py      # zones / zone_versions / reports / batches 表
+  main.py        # FastAPI 路由：禁区/版本/审查/批量审查/分块上传/报告
+  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹、批量输出与分块上传）
+  models.py      # zones / zone_versions / reports / batches
+                 # / upload_sessions / upload_chunks 表
   database.py    # 引擎与会话
   gcode.py       # G-code 词法/模态解析（含多刀 T 切换与静止换刀事件）
   geometry.py    # 多边形校验、点/线段/圆弧距离、弧-多边形最近点
@@ -463,6 +597,10 @@ Z 窗口截取/边界接触为零/负值/无运动段/等值裁决/固化与兼�
 等值执行顺序裁决、非法 T/非法映射 422 不落报告、旧库列迁移与单刀兼容），
 多刀执行事件轨迹（同行 T 与运动分别记录且换刀点先查、轨迹顺序与字段、
 首碰撞对应首个命中事件、最小净间隙沿同一顺序裁决、轨迹随报告固化且不受禁区新版本影响、
-单刀请求与旧报告为 null），以及批量审查（有序逐项结果与报告编号、各项独立引用版本快照、
+单刀请求与旧报告为 null），批量审查（有序逐项结果与报告编号、各项独立引用版本快照、
 任一项非法 422 逐项错误且整批不落报告、失败批次不占用 batch_id、任务/批次标识校验、
-1～50 项边界、相同 batch_id 重放返回首次结果、不同内容 409 冲突且不生成新报告）等场景。
+1～50 项边界、相同 batch_id 重放返回首次结果、不同内容 409 冲突且不生成新报告），
+以及分块上传（会话冻结审查参数与明确版本、乱序块与行中间切块、同号同内容幂等回执/
+同号异内容 409、空块/非 UTF-8/单块 64 KiB/总量 8 MiB 上限、缺块/越界块/摘要不符/
+解析失败均不留报告且会话保持 open、完成与单项审查口径一致、相同声明重放与并发返回
+同一报告、完成后不同声明冲突且拒绝新块、旧库启动幂等建新表）等场景。

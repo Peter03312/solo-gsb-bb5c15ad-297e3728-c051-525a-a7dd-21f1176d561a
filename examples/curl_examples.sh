@@ -241,3 +241,58 @@ curl -s -X POST "$BASE/reviews/batch" \
            "gcode": "G1 X1\n"}
         ]
       }'; echo
+
+echo "== 20) 分块上传：创建会话（冻结禁区版本/初始刀尖/刀半径/可选设置） =="
+# 车间网络不稳时的可恢复提交：先建会话拿到 session_id，
+# 审查参数（禁区编号+明确版本、初始刀尖、刀半径、可选多刀/最小净间隙）
+# 在创建时固定，随后只需分块上传 G-code 文本
+SID=$(curl -s -X POST "$BASE/uploads" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 5, 0],
+        "tool_radius": 0.5,
+        "include_min_clearance": true
+      }' | sed -n 's/.*"session_id":"\([0-9a-f]*\)".*/\1/p')
+echo "session_id: $SID"
+
+echo "== 21) 乱序提交 UTF-8 文本块（单块 <= 64 KiB，总量 <= 8 MiB） =="
+# 完整文本为 "G21 G90 G17\nG1 X15 Y5 Z0\n"，切成 3 块乱序上传；
+# 块体为原始文本（Content-Type 不限），回执含块序号/字节数/SHA-256
+printf 'G21 G90 G17\n' | curl -s -X PUT "$BASE/uploads/$SID/chunks/0" --data-binary @-; echo
+printf '5 Y5 Z0\n'     | curl -s -X PUT "$BASE/uploads/$SID/chunks/2" --data-binary @-; echo
+printf 'G1 X1'         | curl -s -X PUT "$BASE/uploads/$SID/chunks/1" --data-binary @-; echo
+
+echo "== 22) 断网重传：同号同内容返回原回执（200），同号异内容 409 不覆盖 =="
+printf 'G1 X1' | curl -s -X PUT "$BASE/uploads/$SID/chunks/1" --data-binary @-; echo
+printf 'G1 X9' | curl -s -o /dev/null -w "HTTP %{http_code}\n" -X PUT "$BASE/uploads/$SID/chunks/1" --data-binary @-
+
+echo "== 23) 查询已收序号（断点续传依据） =="
+curl -s "$BASE/uploads/$SID"; echo
+
+echo "== 24) 完成：声明块数与拼接文本 SHA-256 => 生成不可变报告（201） =="
+# 仅当 0..块数-1 齐全、无越界块、摘要一致且 G-code 通过审查校验才生成报告；
+# 行号按拼接后的原文计算，结果与 POST /reviews 同口径
+DIGEST=$(printf 'G21 G90 G17\nG1 X15 Y5 Z0\n' | sha256sum | cut -d' ' -f1)
+curl -s -X POST "$BASE/uploads/$SID/complete" \
+  -H 'Content-Type: application/json' \
+  -d "{\"chunk_count\": 3, \"sha256\": \"$DIGEST\"}"; echo
+
+echo "== 25) 相同完成声明重放 => 同一报告（200）；不同声明 => 409；完成后新块 => 409 =="
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/uploads/$SID/complete" \
+  -H 'Content-Type: application/json' \
+  -d "{\"chunk_count\": 3, \"sha256\": \"$DIGEST\"}"
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/uploads/$SID/complete" \
+  -H 'Content-Type: application/json' \
+  -d '{"chunk_count": 3, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}'
+printf 'G1 X0\n' | curl -s -o /dev/null -w "HTTP %{http_code}\n" -X PUT "$BASE/uploads/$SID/chunks/3" --data-binary @-
+
+echo "== 26) 缺块/摘要不符 => 409 且不留报告，会话保持 open 可继续 =="
+SID2=$(curl -s -X POST "$BASE/uploads" \
+  -H 'Content-Type: application/json' \
+  -d '{"zones": [{"zone_no": 1, "version": 1}], "start": [-5, 50, 0],
+       "tool_radius": 0.0}' | sed -n 's/.*"session_id":"\([0-9a-f]*\)".*/\1/p')
+printf 'G1 X15 Y50 Z0\n' | curl -s -X PUT "$BASE/uploads/$SID2/chunks/0" --data-binary @- > /dev/null
+curl -s -X POST "$BASE/uploads/$SID2/complete" \
+  -H 'Content-Type: application/json' \
+  -d '{"chunk_count": 2, "sha256": "'$(printf 'G1 X15 Y50 Z0\n' | sha256sum | cut -d' ' -f1)'"}'; echo

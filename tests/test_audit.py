@@ -1,6 +1,7 @@
 """端到端与单元测试。使用 SQLite 覆盖数据库，无需 PostgreSQL。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -1245,6 +1246,344 @@ class BatchReviewApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 409, r.text)
         self.assertEqual(r.json()["detail"]["error"], "batch_conflict")
         self.assertEqual(self._last_report_id(), last_id + 1)
+
+
+class UploadSessionApiTests(unittest.TestCase):
+    """长 G-code 可恢复分块上传：会话冻结审查参数、0 起序号乱序块、
+    同号同内容幂等/同号异内容冲突、单块与总量上限、完成声明
+    （缺块/越界块/摘要不符/解析失败均不留报告）、重放与并发返回
+    同一报告、完成后不同声明冲突且拒绝新块、与单项审查口径一致。"""
+
+    @classmethod
+    def setUpClass(cls):
+        client.post("/zones", json={"zone_no": 600, "polygon": SQUARE,
+                                    "z_min": -5, "z_max": 5})
+
+    def _create(self, **kw):
+        body = {"zones": [{"zone_no": 600, "version": 1}],
+                "start": [-5, 5, 0], "tool_radius": 0.0}
+        body.update(kw)
+        r = client.post("/uploads", json=body)
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def _put(self, sid, seq, data):
+        return client.put(f"/uploads/{sid}/chunks/{seq}", content=data)
+
+    def _complete(self, sid, count, digest):
+        return client.post(f"/uploads/{sid}/complete",
+                           json={"chunk_count": count, "sha256": digest})
+
+    def _last_report_id(self):
+        # 提交一条确定无碰撞的单项审查，用其 report_id 定位报告序列末端
+        r = client.post("/reviews", json={
+            "zones": [{"zone_no": 600, "version": 1}],
+            "start": [-5, 50, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y50 Z0\n"})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["report_id"]
+
+    @staticmethod
+    def _sha(text):
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def test_01_out_of_order_complete_and_parity(self):
+        # 块边界切在行中间：行号按拼接后的原文计算
+        full = "G21 G90 G17\nG1 X15 Y5 Z0\n"
+        parts = ["G21 G90 G17\n", "G1 X1", "5 Y5 Z0\n"]
+        sess = self._create(tool_radius=0.5, include_min_clearance=True)
+        sid = sess["session_id"]
+        self.assertEqual(sess["status"], "open")
+        self.assertEqual(sess["received_seqs"], [])
+        self.assertEqual(sess["max_chunk_bytes"], 64 * 1024)
+        self.assertEqual(sess["max_total_bytes"], 8 * 1024 * 1024)
+        # 冻结的审查参数随会话固化
+        self.assertEqual(sess["params"]["tool_radius"], 0.5)
+        self.assertEqual(sess["params"]["zones"],
+                         [{"zone_no": 600, "version": 1}])
+
+        receipts = {}
+        for seq in (1, 2, 0):  # 乱序到达
+            r = self._put(sid, seq, parts[seq].encode("utf-8"))
+            self.assertEqual(r.status_code, 201, r.text)
+            receipts[seq] = r.json()
+            self.assertEqual(receipts[seq]["seq"], seq)
+            self.assertEqual(receipts[seq]["byte_len"],
+                             len(parts[seq].encode("utf-8")))
+            self.assertEqual(receipts[seq]["sha256"],
+                             hashlib.sha256(
+                                 parts[seq].encode("utf-8")).hexdigest())
+
+        # 可查询已收序号
+        st = client.get(f"/uploads/{sid}").json()
+        self.assertEqual(st["received_seqs"], [0, 1, 2])
+        self.assertEqual(st["received_count"], 3)
+        self.assertEqual(st["total_bytes"], len(full.encode("utf-8")))
+        self.assertIsNone(st["report_id"])
+
+        # 完成：声明块数与整文 SHA-256 => 201 生成不可变报告
+        r = self._complete(sid, 3, self._sha(full))
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        self.assertTrue(body["has_collision"])
+        self.assertEqual(body["collision_line_no"], 2)  # 按拼接原文计行号
+        self.assertEqual(body["collision_zone_no"], 600)
+        self.assertIsNotNone(body["min_clearance"])
+
+        # 与现有单项审查口径一致（除 report_id 外逐项相同）
+        direct = client.post("/reviews", json={
+            "zones": [{"zone_no": 600, "version": 1}],
+            "start": [-5, 5, 0], "tool_radius": 0.5, "gcode": full,
+            "include_min_clearance": True}).json()
+        for k in ("used_zone_versions", "input_summary", "has_collision",
+                  "collision_line_no", "collision_zone_no", "conclusion",
+                  "message", "min_clearance", "min_clearance_enabled",
+                  "collision_tool_no", "collision_tool_radius_mm",
+                  "execution_trace"):
+            self.assertEqual(body[k], direct[k], k)
+
+        # 报告真实落库且不可变查询一致
+        got = client.get(f"/reports/{body['report_id']}").json()
+        self.assertTrue(got["has_collision"])
+        self.assertEqual(got["collision_line_no"], 2)
+        # 会话状态固化
+        st = client.get(f"/uploads/{sid}").json()
+        self.assertEqual(st["status"], "completed")
+        self.assertEqual(st["report_id"], body["report_id"])
+        self.assertEqual(st["declared_chunk_count"], 3)
+        self.assertEqual(st["declared_sha256"], self._sha(full))
+
+    def test_02_chunk_retransmit_idempotent_and_conflict(self):
+        sid = self._create()["session_id"]
+        r = self._put(sid, 0, b"G21 G90\n")
+        self.assertEqual(r.status_code, 201)
+        first = r.json()
+        # 同号同内容重传 => 200 原回执，计数不变
+        r = self._put(sid, 0, b"G21 G90\n")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), first)
+        st = client.get(f"/uploads/{sid}").json()
+        self.assertEqual(st["received_count"], 1)
+        self.assertEqual(st["total_bytes"], 8)
+        # 同号异内容 => 409，原块不被覆盖
+        r = self._put(sid, 0, b"G21 G91\n")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["error"], "chunk_conflict")
+        st = client.get(f"/uploads/{sid}").json()
+        self.assertEqual(st["received_count"], 1)
+        self.assertEqual(st["total_bytes"], 8)
+
+    def test_03_chunk_validation(self):
+        sid = self._create()["session_id"]
+        # 空块 / 非 UTF-8 / 超 64 KiB / 序号越界
+        self.assertEqual(self._put(sid, 0, b"").status_code, 422)
+        r = self._put(sid, 0, b"\xff\xfeG1")
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["detail"]["error"], "invalid_encoding")
+        r = self._put(sid, 0, b"X" * (64 * 1024 + 1))
+        self.assertEqual(r.status_code, 413)
+        self.assertEqual(r.json()["detail"]["error"], "chunk_too_large")
+        # 恰好 64 KiB 允许
+        r = self._put(sid, 0, b"X" * (64 * 1024))
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(client.put(
+            f"/uploads/{sid}/chunks/-1", content=b"a").status_code, 422)
+        self.assertEqual(client.put(
+            f"/uploads/{sid}/chunks/8388608", content=b"a").status_code, 422)
+        # 会话不存在 => 404
+        self.assertEqual(self._put("0" * 32, 0, b"a").status_code, 404)
+        self.assertEqual(client.get("/uploads/" + "0" * 32).status_code, 404)
+        self.assertEqual(self._complete("0" * 32, 1, "0" * 64).status_code,
+                         404)
+
+    def test_04_total_size_limit(self):
+        sid = self._create()["session_id"]
+        chunk = b"X" * (64 * 1024)
+        for seq in range(128):  # 128 x 64 KiB = 8 MiB，正好到上限
+            r = self._put(sid, seq, chunk)
+            self.assertEqual(r.status_code, 201, f"seq={seq}: {r.text}")
+        st = client.get(f"/uploads/{sid}").json()
+        self.assertEqual(st["total_bytes"], 8 * 1024 * 1024)
+        # 再 1 字节即超限
+        r = self._put(sid, 128, b"a")
+        self.assertEqual(r.status_code, 413)
+        self.assertEqual(r.json()["detail"]["error"], "total_size_exceeded")
+        st = client.get(f"/uploads/{sid}").json()
+        self.assertEqual(st["received_count"], 128)
+
+    def test_05_failed_completions_leave_no_report(self):
+        last_id = self._last_report_id()
+        full = "G1 X15 Y5 Z0\n"
+        sid = self._create()["session_id"]
+        self._put(sid, 0, full.encode("utf-8"))
+        # 缺块 => 409 incomplete_upload
+        r = self._complete(sid, 2, self._sha(full))
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["error"], "incomplete_upload")
+        self.assertEqual(r.json()["detail"]["missing_seqs"], [1])
+        # 越界块（已上传序号超出声明块数）=> 409
+        self._put(sid, 1, b"G1 X0\n")
+        r = self._complete(sid, 1, self._sha(full))
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["error"], "unexpected_chunks")
+        # 摘要不符 => 409
+        r = self._complete(sid, 2, "0" * 64)
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["error"], "digest_mismatch")
+        # 解析失败 => 422 invalid_gcode（与单项审查同形），不留报告
+        bad = self._create()["session_id"]
+        self._put(bad, 0, b"G54 G1 X1\n")
+        r = self._complete(bad, 1, self._sha("G54 G1 X1\n"))
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["detail"]["error"], "invalid_gcode")
+        # 以上均不留报告、会话保持 open，可修正后完成
+        self.assertEqual(self._last_report_id(), last_id + 1)
+        for s in (sid, bad):
+            self.assertEqual(client.get(f"/uploads/{s}").json()["status"],
+                             "open")
+        # 修正声明后完成成功
+        r = self._complete(sid, 2, self._sha(full + "G1 X0\n"))
+        self.assertEqual(r.status_code, 201, r.text)
+
+    def test_06_replay_and_post_completion_rules(self):
+        full = "G1 X15 Y5 Z0\n"
+        sid = self._create()["session_id"]
+        self._put(sid, 0, full.encode("utf-8"))
+        last_id = self._last_report_id()
+        r = self._complete(sid, 1, self._sha(full))
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        # 相同完成声明重放 => 200，同一报告，响应逐字节一致
+        r = self._complete(sid, 1, self._sha(full))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), body)
+        # 大写 hex 摘要视为同一声明
+        r = self._complete(sid, 1, self._sha(full).upper())
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["report_id"], body["report_id"])
+        # 不同声明 => 409 completion_conflict
+        r = self._complete(sid, 2, self._sha(full))
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["error"], "completion_conflict")
+        r = self._complete(sid, 1, "1" * 64)
+        self.assertEqual(r.status_code, 409)
+        # 重放与冲突均不生成新报告
+        self.assertEqual(self._last_report_id(), last_id + 2)
+        # 完成后拒绝新块；同号同内容重传仍返回原回执
+        r = self._put(sid, 1, b"G1 X0\n")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["error"], "session_completed")
+        r = self._put(sid, 0, full.encode("utf-8"))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["seq"], 0)
+        r = self._put(sid, 0, b"G1 X0\n")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["error"], "chunk_conflict")
+
+    def test_07_multi_tool_and_clearance_parity(self):
+        # 多刀 + 最小净间隙：完成结果与单项审查口径一致
+        full = "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"
+        params = {"start": [-5, 11, 0], "tool_radius": 0.0,
+                  "tool_radii": {"2": 2.0}, "include_min_clearance": True}
+        sid = self._create(**params)["session_id"]
+        self._put(sid, 0, full.encode("utf-8"))
+        r = self._complete(sid, 1, self._sha(full))
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        direct = client.post("/reviews", json={
+            "zones": [{"zone_no": 600, "version": 1}], "gcode": full,
+            **params}).json()
+        for k in ("has_collision", "collision_line_no",
+                  "collision_zone_no", "collision_tool_no",
+                  "collision_tool_radius_mm", "min_clearance",
+                  "execution_trace", "input_summary"):
+            self.assertEqual(body[k], direct[k], k)
+        self.assertEqual(body["collision_line_no"], 3)
+        self.assertEqual(body["collision_tool_no"], 2)
+        self.assertIsNotNone(body["execution_trace"])
+
+    def test_08_complete_request_validation(self):
+        sid = self._create()["session_id"]
+        self._put(sid, 0, b"G1 X1\n")
+        # 块数必须为正整数
+        self.assertEqual(self._complete(sid, 0, "0" * 64).status_code, 422)
+        self.assertEqual(self._complete(sid, -1, "0" * 64).status_code, 422)
+        # 摘要必须为 64 位 hex
+        self.assertEqual(self._complete(sid, 1, "abc").status_code, 422)
+        self.assertEqual(self._complete(sid, 1, "g" * 64).status_code, 422)
+        # 校验失败不消耗会话
+        self.assertEqual(client.get(f"/uploads/{sid}").json()["status"],
+                         "open")
+
+    def test_09_session_creation_validation_and_frozen_version(self):
+        # 禁区/版本不存在 => 404；重复引用/非法参数 => 422
+        r = client.post("/uploads", json={
+            "zones": [{"zone_no": 999, "version": 1}],
+            "start": [0, 0, 0], "tool_radius": 0.0})
+        self.assertEqual(r.status_code, 404)
+        r = client.post("/uploads", json={
+            "zones": [{"zone_no": 600, "version": 9}],
+            "start": [0, 0, 0], "tool_radius": 0.0})
+        self.assertEqual(r.status_code, 404)
+        r = client.post("/uploads", json={
+            "zones": [{"zone_no": 600, "version": 1},
+                      {"zone_no": 600, "version": 1}],
+            "start": [0, 0, 0], "tool_radius": 0.0})
+        self.assertEqual(r.status_code, 422)
+        r = client.post("/uploads", json={
+            "zones": [{"zone_no": 600, "version": 1}],
+            "start": [0, 0, 0], "tool_radius": 0.0,
+            "include_min_clearance": "true"})
+        self.assertEqual(r.status_code, 422)
+        r = client.post("/uploads", json={
+            "zones": [{"zone_no": 600, "version": 1}],
+            "start": [0, 0, 0], "tool_radius": 0.0,
+            "tool_radii": {"1": -0.5}})
+        self.assertEqual(r.status_code, 422)
+
+        # 创建时固定明确版本：随后禁区出新版本不影响会话完成的审查
+        r = client.post("/zones", json={"polygon": SQUARE,
+                                        "z_min": -5, "z_max": 5})
+        no = r.json()["zone_no"]
+        sid = client.post("/uploads", json={
+            "zones": [{"zone_no": no, "version": 1}],
+            "start": [-5, 5, 0], "tool_radius": 0.0}).json()["session_id"]
+        client.post(f"/zones/{no}/versions", json={
+            "polygon": [[100, 100], [110, 100], [110, 110], [100, 110]],
+            "z_min": -5, "z_max": 5})
+        full = "G1 X15 Y5 Z0\n"
+        self._put(sid, 0, full.encode("utf-8"))
+        r = self._complete(sid, 1, self._sha(full))
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertTrue(r.json()["has_collision"])  # 仍按 v1 判定
+        self.assertEqual(r.json()["used_zone_versions"], {str(no): 1})
+
+    def test_10_concurrent_complete_returns_same_report(self):
+        import threading
+        full = "G1 X15 Y5 Z0\n"
+        sid = self._create()["session_id"]
+        self._put(sid, 0, full.encode("utf-8"))
+        last_id = self._last_report_id()
+        outcomes = []
+
+        def worker():
+            c2 = TestClient(app)
+            resp = c2.post(f"/uploads/{sid}/complete",
+                           json={"chunk_count": 1, "sha256": self._sha(full)})
+            outcomes.append((resp.status_code,
+                             resp.json().get("report_id")))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 相同完成请求并发：恰好一次 201，其余 200，报告同一
+        self.assertEqual(sorted(sc for sc, _ in outcomes),
+                         [200, 200, 200, 201])
+        self.assertEqual(len({rid for _, rid in outcomes}), 1)
+        # 只生成一份报告
+        self.assertEqual(self._last_report_id(), last_id + 2)
 
 
 class SchemaMigrationTests(unittest.TestCase):
