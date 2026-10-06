@@ -80,11 +80,16 @@ class ZoneRef(BaseModel):
     version: int = Field(ge=1)
 
 
-class ReviewRequest(BaseModel):
+class ReviewParamsBase(BaseModel):
+    """审查参数基类：禁区编号+明确版本、初始刀尖坐标、初始刀半径，
+    以及可选多刀映射与最小净间隙开关。
+
+    单项审查（ReviewRequest）与可恢复上传会话（UploadSessionCreate）
+    共用同一套字段与校验口径，保证两种入口的完成结果一致。
+    """
     zones: list[ZoneRef] = Field(min_length=1)
     start: tuple[float, float, float]
     tool_radius: float = Field(ge=0.0)
-    gcode: str = Field(min_length=1)
     # 可选：启用后计算全程最小水平净间隙并随报告固化
     include_min_clearance: bool = False
     # 可选：多刀模式。非负整数刀号 -> 非负有限毫米半径。
@@ -146,6 +151,10 @@ class ReviewRequest(BaseModel):
         for c in v:
             _finite(c, "初始刀尖坐标")
         return tuple(float(c) for c in v)  # type: ignore[return-value]
+
+
+class ReviewRequest(ReviewParamsBase):
+    gcode: str = Field(min_length=1)
 
 
 class MinClearanceOut(BaseModel):
@@ -260,3 +269,103 @@ class BatchReviewResponse(BaseModel):
     batch_id: str
     item_count: int
     results: list[BatchItemResult]
+
+
+# ---------- 长 G-code 可恢复上传会话 ----------
+
+# 单块上限 64 KiB、会话总量上限 8 MiB（均按 UTF-8 字节计）
+MAX_CHUNK_BYTES = 64 * 1024
+MAX_SESSION_BYTES = 8 * 1024 * 1024
+
+
+class UploadSessionCreate(ReviewParamsBase):
+    """创建上传会话：固定禁区编号+明确版本、初始刀尖坐标、初始刀半径，
+    以及可选多刀映射/最小净间隙开关（与 POST /reviews 同口径）。"""
+
+
+class UploadSessionOut(BaseModel):
+    """创建会话的回执：会话标识与会话固定的审查参数。"""
+    session_id: str
+    status: Literal["open", "completed"]
+    zones: list[ZoneRef]
+    start: tuple[float, float, float]
+    tool_radius: float
+    include_min_clearance: bool = False
+    tool_radii: dict[int, float] | None = None
+    max_chunk_bytes: int = Field(description="单块 UTF-8 字节上限（64 KiB）")
+    max_session_bytes: int = Field(description="会话总量 UTF-8 字节上限（8 MiB）")
+    created_at: datetime
+
+
+class UploadChunkReceipt(BaseModel):
+    """块提交回执：同号同内容重传返回原回执。"""
+    session_id: str
+    seq: int = Field(description="块序号（从 0 起）")
+    size_bytes: int = Field(description="该块 UTF-8 编码字节数")
+    chunk_sha256: str = Field(description="该块 UTF-8 字节的 SHA-256")
+    received_seqs: list[int] = Field(
+        description="会话当前已收块序号（升序），可据此重传缺块")
+    received_count: int = Field(description="已收块数")
+    total_bytes: int = Field(description="会话已收 UTF-8 字节总量")
+    resubmitted: bool = Field(
+        default=False,
+        description="true 表示同号同内容重传（返回的是首次原回执数据）")
+
+
+class UploadSessionStatus(BaseModel):
+    """会话状态：固定参数、已收序号与完成状态。"""
+    session_id: str
+    status: Literal["open", "completed"]
+    zones: list[ZoneRef]
+    start: tuple[float, float, float]
+    tool_radius: float
+    include_min_clearance: bool = False
+    tool_radii: dict[int, float] | None = None
+    received_seqs: list[int]
+    received_count: int
+    total_bytes: int
+    max_chunk_bytes: int
+    max_session_bytes: int
+    # 完成后回显首次完成声明；未完成为 null
+    block_count: int | None = None
+    content_sha256: str | None = None
+    report_id: int | None = Field(
+        default=None, description="完成后生成的不可变报告标识；未完成为 null")
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class UploadCompleteRequest(BaseModel):
+    """完成声明：正整数块数与拼接后 UTF-8 文本的 SHA-256。"""
+    block_count: int = Field(ge=1, description="正整数块数")
+    sha256: str = Field(min_length=1, max_length=64,
+                        description="拼接后文本 UTF-8 字节的 SHA-256（十六进制）")
+
+    @field_validator("sha256")
+    @classmethod
+    def _sha(cls, v: str) -> str:
+        norm = v.strip().lower()
+        if len(norm) != 64 or any(c not in "0123456789abcdef" for c in norm):
+            raise ValueError("sha256 必须为 64 位十六进制摘要")
+        return norm
+
+
+class UploadCompleteResponse(BaseModel):
+    """完成结果：会话标识 + 与 POST /reviews 完全同构的审查结果。
+
+    相同完成请求并发或重放返回同一报告（report_id 不变）。
+    """
+    session_id: str
+    report_id: int
+    used_zone_versions: dict[str, int]
+    input_summary: dict[str, Any]
+    has_collision: bool
+    collision_line_no: int | None
+    collision_zone_no: int | None
+    conclusion: Literal["collision", "no_collision"]
+    message: str
+    min_clearance: MinClearanceOut | None = None
+    min_clearance_enabled: bool = False
+    collision_tool_no: int | None = None
+    collision_tool_radius_mm: float | None = None
+    execution_trace: list[TraceEventOut] | None = None

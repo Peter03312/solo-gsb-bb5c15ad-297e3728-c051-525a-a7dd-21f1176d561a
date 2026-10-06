@@ -241,3 +241,48 @@ curl -s -X POST "$BASE/reviews/batch" \
            "gcode": "G1 X1\n"}
         ]
       }'; echo
+
+echo "== 20) 长 G-code 可恢复上传：创建会话（固定禁区版本/初始刀尖/刀半径） =="
+SID=$(curl -s -X POST "$BASE/uploads" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 5, 0],
+        "tool_radius": 0.0,
+        "include_min_clearance": true
+      }' | sed -n 's/.*"session_id":"\([0-9a-f]*\)".*/\1/p')
+echo "session_id=$SID"
+
+echo "== 21) 提交 UTF-8 文本块（序号从 0 起，请求体为明文，可乱序/重传） =="
+# 单块不超过 64 KiB、会话总量不超过 8 MiB；务必在 UTF-8 字符边界切块
+printf 'G21 G90 G17\nG1 X-5 Y5 Z0\n' | \
+  curl -s -X PUT "$BASE/uploads/$SID/chunks/0" \
+    -H 'Content-Type: application/octet-stream' --data-binary @-; echo
+printf 'G1 X15 Y5 Z0\n' | \
+  curl -s -X PUT "$BASE/uploads/$SID/chunks/1" \
+    -H 'Content-Type: application/octet-stream' --data-binary @-; echo
+
+echo "== 22) 查询已收序号（断点续传前先查缺哪些块） =="
+curl -s "$BASE/uploads/$SID"; echo
+
+echo "== 23) 同号同内容重传返回原回执（resubmitted=true）；同号异内容 409 =="
+printf 'G1 X15 Y5 Z0\n' | \
+  curl -s -X PUT "$BASE/uploads/$SID/chunks/1" \
+    -H 'Content-Type: application/octet-stream' --data-binary @-; echo
+
+echo "== 24) 完成：声明正整数块数与拼接文本 SHA-256，返回既有审查口径结果 =="
+DIGEST=$(printf 'G21 G90 G17\nG1 X-5 Y5 Z0\nG1 X15 Y5 Z0\n' | sha256sum | cut -d' ' -f1)
+curl -s -X POST "$BASE/uploads/$SID/complete" \
+  -H 'Content-Type: application/json' \
+  -d "{\"block_count\": 2, \"sha256\": \"$DIGEST\"}"; echo
+
+echo "== 25) 相同完成请求重放：200 同一报告；不同声明 409；完成后新块 409 =="
+curl -s -o /dev/null -w "replay HTTP %{http_code}\n" -X POST "$BASE/uploads/$SID/complete" \
+  -H 'Content-Type: application/json' \
+  -d "{\"block_count\": 2, \"sha256\": \"$DIGEST\"}"
+curl -s -o /dev/null -w "conflict HTTP %{http_code}\n" -X POST "$BASE/uploads/$SID/complete" \
+  -H 'Content-Type: application/json' \
+  -d "{\"block_count\": 3, \"sha256\": \"$DIGEST\"}"
+printf 'x' | curl -s -o /dev/null -w "new chunk HTTP %{http_code}\n" \
+  -X PUT "$BASE/uploads/$SID/chunks/9" \
+  -H 'Content-Type: application/octet-stream' --data-binary @-

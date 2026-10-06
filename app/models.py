@@ -3,7 +3,9 @@
 - zones：禁区逻辑实体（编号唯一）；
 - zone_versions：禁区的不可变版本，每次修改产生新版本，旧版本保留；
 - reports：审查报告，创建后不可变，不随后续禁区版本变化；
-- batches：批量审查批次（batch_id 幂等键 + 内容哈希 + 逐项结果快照）。
+- batches：批量审查批次（batch_id 幂等键 + 内容哈希 + 逐项结果快照）；
+- upload_sessions：长 G-code 可恢复上传会话（固定审查参数、完成状态、
+  完成声明与审查结果快照），upload_chunks：从 0 起序号的 UTF-8 文本块。
 """
 from __future__ import annotations
 
@@ -105,4 +107,64 @@ class Batch(Base):
     item_count = Column(Integer, nullable=False)
     # 逐项结果快照 [{index, task_id, result: {report_id, ...}}]，按输入顺序
     results = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class UploadSession(Base):
+    """长 G-code 可恢复上传会话。
+
+    创建时即固定审查参数（禁区编号+明确版本、初始刀尖坐标、初始刀半径、
+    可选多刀映射与最小净间隙开关），存为规范化 JSON。块乱序提交到
+    upload_chunks；完成时校验块齐全、总量、拼接 SHA-256 与既有审查口径，
+    通过则在同一事务落报告并把会话置为 completed，固化完成声明与审查结果
+    快照（completed_result），完成重放原样返回；缺块/超限/摘要不符/解析失败
+    均不置完成、不留报告。完成后拒绝新块与不同声明。
+    """
+
+    __tablename__ = "upload_sessions"
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'completed')",
+                        name="ck_upload_session_status"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(String(36), nullable=False, unique=True)
+    # open：可继续提交块；completed：已生成不可变报告，拒绝写入
+    status = Column(String(16), nullable=False, default="open",
+                    server_default="open")
+    # 创建时固定的审查参数（规范化 JSON）：
+    # {zones, start, tool_radius, include_min_clearance, tool_radii}
+    params = Column(JSON, nullable=False)
+    # 完成时声明的块数、拼接文本 SHA-256（open 时为 NULL）
+    block_count = Column(Integer, nullable=True)
+    content_sha256 = Column(String(64), nullable=True)
+    # 已收块总字节数（UTF-8）
+    total_bytes = Column(Integer, nullable=False, default=0, server_default="0")
+    # 完成时的审查结果快照（与 POST /reviews 同构），重放原样返回
+    completed_result = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class UploadChunk(Base):
+    """上传会话中的一个 UTF-8 文本块（序号从 0 起，同会话内唯一）。
+
+    content 存 UTF-8 解码后的文本；size_bytes 为该块 UTF-8 编码字节数
+    （单块 ≤ 64 KiB，会话总量 ≤ 8 MiB，均在写入路径强制）；
+    content_sha256 为该块 UTF-8 字节 SHA-256，用于同号重放返回原回执。
+    """
+
+    __tablename__ = "upload_chunks"
+    __table_args__ = (
+        CheckConstraint("seq >= 0", name="ck_upload_chunk_seq_nonneg"),
+        Index("ix_upload_chunk_session_seq", "session_id", "seq", unique=True),
+    )
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey("upload_sessions.id"),
+                        nullable=False)
+    seq = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    content_sha256 = Column(String(64), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)

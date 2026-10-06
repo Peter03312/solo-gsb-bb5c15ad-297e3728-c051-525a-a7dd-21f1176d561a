@@ -40,6 +40,12 @@
   G-code 及可选最小净间隙/多刀参数；**同一事务**中先校验整批并固定各项禁区版本快照，
   任一项非法返回**逐项错误**且整批不落报告，全部通过才按输入顺序生成不可变报告；
   相同 `batch_id` 重放按内容判定幂等/冲突；
+- **长 G-code 可恢复上传会话**（`/uploads`，见下文「长 G-code 可恢复上传」）：
+  车间网络不稳时把长文本切成 **≤64 KiB 的 UTF-8 文本块**、用**从 0 起的序号**
+  **乱序/断点重传**；创建会话时固定禁区编号与明确版本、初始刀尖坐标、刀半径及可选
+  多刀/最小净间隙参数；会话总量 **≤8 MiB**；完成时声明正整数块数与拼接文本 SHA-256，
+  仅在 `0..N-1` 齐全、摘要一致且整份 G-code 通过既有审查时生成**不可变报告**
+  （行号按拼接后原文），相同完成请求并发/重放返回同一报告；
 - 报告**一旦生成不可变**，后续禁区更新新版本不影响任何旧报告；
 - 非法几何、负/非法刀具半径、非法圆弧、不支持的运动/坐标系指令、非法开关类型，以及多刀模式下
   非整数/负数 `T`、同行多个 `T`、未映射刀号、非法映射半径一律返回 `422`，**不留任何报告**。
@@ -62,8 +68,9 @@ docker compose up --build
 首次启动时应用会自动连接 PostgreSQL 并完成数据库表初始化（`create_all`），无需手工建表；
 对**升级前的旧库**会幂等补齐 `reports` 表的最小净间隙列（`ALTER TABLE ... ADD COLUMN`），
 v1.2 的多刀命中刀号/半径列（`collision_tool_no` / `collision_tool_radius`），
-以及 v1.3 的执行事件轨迹列（`execution_trace`）；v1.4 新增的 `batches` 批量审查表
-由 `create_all` 对旧库幂等建出。
+以及 v1.3 的执行事件轨迹列（`execution_trace`）；v1.4 新增的 `batches` 批量审查表与
+v1.5 新增的 `upload_sessions` / `upload_chunks` 可恢复上传表由 `create_all` 对旧库
+幂等建出。
 旧报告读取为 `min_clearance_enabled=false`、`min_clearance=null`，多刀字段为 `null`，
 `execution_trace=null`，旧请求行为不变。
 
@@ -380,6 +387,136 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
 
 `GET /reports/{report_id}`
 
+### 9. 长 G-code 可恢复上传（分片会话，断点重传）
+
+面向车间网络不稳场景：先创建会话固定全部审查参数，再把长 G-code 切成 UTF-8 文本块
+按序号提交，块**可乱序到达、可反复重传**，随时查询已收序号；全部到齐后声明块数与
+拼接 SHA-256 完成，服务按**既有单项审查同一口径**生成不可变报告。会话与块均落库，
+**跨服务重启保留**。
+
+**限制**：单块 UTF-8 字节数 **≤ 64 KiB（65536）**；会话已收总量
+**≤ 8 MiB（8388608）**；块序号 **≥0**；块数声明为**正整数**。
+切块必须在 **UTF-8 字符边界**（一个多字节字符不能跨块切开，否则该块不是合法 UTF-8）。
+
+#### 9.1 创建上传会话（固定审查参数）
+
+`POST /uploads`，请求体与 `POST /reviews` 的审查参数完全一致（不含 `gcode`）：
+
+```json
+{
+  "zones": [{"zone_no": 1, "version": 1}],
+  "start": [-5.0, 5.0, 0.0],
+  "tool_radius": 0.0,
+  "include_min_clearance": true,
+  "tool_radii": {"1": 0.5, "2": 2.0}
+}
+```
+
+返回 `201`：
+
+```json
+{
+  "session_id": "9f1c…（32 位十六进制）",
+  "status": "open",
+  "zones": [{"zone_no": 1, "version": 1}],
+  "start": [-5.0, 5.0, 0.0],
+  "tool_radius": 0.0,
+  "include_min_clearance": true,
+  "tool_radii": {"1": 0.5, "2": 2.0},
+  "max_chunk_bytes": 65536,
+  "max_session_bytes": 8388608,
+  "created_at": "2026-10-06T..."
+}
+```
+
+禁区编号/版本在创建时即校验（不存在返回 `404`），参数口径与单项审查一致（非法 `422`）。
+
+#### 9.2 提交文本块（序号从 0 起，乱序、可重传）
+
+`PUT /uploads/{session_id}/chunks/{seq}`，请求体为块的 **UTF-8 明文字节**
+（`Content-Type: application/octet-stream` 或不设置均可；不是 JSON 包装）。
+
+- 成功（首次收到该序号）返回 `200`：
+
+```json
+{
+  "session_id": "9f1c…",
+  "seq": 0,
+  "size_bytes": 42,
+  "chunk_sha256": "…（该块 UTF-8 字节的 SHA-256）",
+  "received_seqs": [0, 2],
+  "received_count": 2,
+  "total_bytes": 100,
+  "resubmitted": false
+}
+```
+
+- **同号同内容重传**：返回同一序号的**原回执**（`resubmitted: true`），不重复入库；
+- **同号异内容**：`409 chunk_conflict`，原块保留不被覆盖；
+- 块超过 64 KiB：`413 chunk_too_large`；会话累计超过 8 MiB：
+  `413 session_too_large`（该块不收）；
+- 块不是合法 UTF-8：`422 invalid_utf8`（不收；客户端应在字符边界重新切块）；
+- 会话不存在：`404`；会话已完成：`409 session_completed`（拒绝一切新块）。
+
+#### 9.3 查询会话状态（已收序号）
+
+`GET /uploads/{session_id}`：
+
+```json
+{
+  "session_id": "9f1c…",
+  "status": "open",
+  "zones": [{"zone_no": 1, "version": 1}],
+  "start": [-5.0, 5.0, 0.0],
+  "tool_radius": 0.0,
+  "include_min_clearance": true,
+  "tool_radii": null,
+  "received_seqs": [0, 2],
+  "received_count": 2,
+  "total_bytes": 100,
+  "max_chunk_bytes": 65536,
+  "max_session_bytes": 8388608,
+  "block_count": null,
+  "content_sha256": null,
+  "report_id": null,
+  "created_at": "...",
+  "completed_at": null
+}
+```
+
+客户端续传前据此计算缺失序号并只补传缺块。
+
+#### 9.4 完成（声明块数与摘要，生成不可变报告）
+
+`POST /uploads/{session_id}/complete`：
+
+```json
+{"block_count": 3, "sha256": "<拼接后整份 G-code 的 UTF-8 SHA-256，十六进制>"}
+```
+
+仅当以下条件全部满足才返回 `201`，响应体即**与 `POST /reviews` 完全同构的审查结果**
+（额外带 `session_id`；碰撞行号按**拼接后原文**行号计算），并在同一事务生成
+不可变 `reports` 行（用其 `report_id` 可继续 `GET /reports/{id}` 回看）：
+
+1. 已收序号恰为 `0, 1, …, block_count-1`（齐全、无超出声明范围的块）；
+2. 会话总量 ≤ 8 MiB；
+3. 按序号拼接后的文本 SHA-256 与声明一致；
+4. 拼接文本通过既有 G-code 解析与几何审查。
+
+否则**不留报告**：
+
+| 情形 | 状态码 | error | 会话状态 |
+| --- | --- | --- | --- |
+| 块不齐全（缺块/声明块数不符） | `409` | `blocks_incomplete`（含 `missing_seqs`/`extra_seqs`） | 保持 open，可补传后重试 |
+| 总量超 8 MiB | `413` | `session_too_large` | 保持 open |
+| SHA-256 不符 | `422` | `sha256_mismatch`（回带 `actual_sha256`） | 保持 open，可改声明重试 |
+| G-code 解析失败 | `422` | `invalid_gcode`（带原行号 `line_no`） | 保持 open |
+| 几何/参数非法 | 与单项审查一致（`422` / `invalid_geometry`） | — | 保持 open |
+
+**重放与冲突**：成功完成后，相同（`block_count` + `sha256`）完成请求
+（并发或重放）返回 `200` 与**同一报告**（`report_id` 不变，不生成新报告）；
+**不同声明返回 `409 completion_conflict`**；此后任何新块返回 `409 session_completed`。
+
 ## 命令行调用示例
 
 另见 `examples/curl_examples.sh` 与 `examples/python_client.py`。
@@ -435,16 +572,18 @@ curl -s -X POST http://localhost:8080/reviews \
 
 ```
 app/
-  main.py        # FastAPI 路由：禁区/版本/审查/批量审查/报告
-  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹与批量输出）
-  models.py      # zones / zone_versions / reports / batches 表
+  main.py        # FastAPI 路由：禁区/版本/审查/批量审查/可恢复上传会话/报告
+  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹、批量输出、上传会话）
+  models.py      # zones / zone_versions / reports / batches /
+                 # upload_sessions / upload_chunks 表
   database.py    # 引擎与会话
   gcode.py       # G-code 词法/模态解析（含多刀 T 切换与静止换刀事件）
   geometry.py    # 多边形校验、点/线段/圆弧距离、弧-多边形最近点
   collision.py   # 连续运动碰撞引擎（精确区间求解 + 圆弧二分）+ 全程最小净间隙
                  # + 多刀执行事件轨迹（按执行顺序检查）
-examples/        # curl 与 Python 调用示例
+examples/        # curl 与 Python 调用示例（含可恢复上传完整流程）
 tests/test_audit.py
+tests/test_uploads.py
 Dockerfile
 docker-compose.yml
 ```
@@ -453,16 +592,15 @@ docker-compose.yml
 
 ```bash
 pip install httpx
-python -m unittest tests.test_audit -v
+python -m unittest tests.test_audit tests.test_uploads -v
 ```
 
-测试使用 SQLite 内存文件覆盖数据库，共覆盖几何校验、线段/圆弧碰撞、模态解析、
-版本不可变、旧报告不变、非法输入不落报告、可选全程最小净间隙（直线/圆弧/整圆/
-Z 窗口截取/边界接触为零/负值/无运动段/等值裁决/固化与兼容），多刀半径映射
-（同行/独立 T 生效、模态延续、初始刀位空刀号、静止换刀命中、按事件半径计算首碰撞与净间隙、
-等值执行顺序裁决、非法 T/非法映射 422 不落报告、旧库列迁移与单刀兼容），
-多刀执行事件轨迹（同行 T 与运动分别记录且换刀点先查、轨迹顺序与字段、
-首碰撞对应首个命中事件、最小净间隙沿同一顺序裁决、轨迹随报告固化且不受禁区新版本影响、
-单刀请求与旧报告为 null），以及批量审查（有序逐项结果与报告编号、各项独立引用版本快照、
-任一项非法 422 逐项错误且整批不落报告、失败批次不占用 batch_id、任务/批次标识校验、
-1～50 项边界、相同 batch_id 重放返回首次结果、不同内容 409 冲突且不生成新报告）等场景。
+测试使用 SQLite 内存文件覆盖数据库，`test_audit.py` 覆盖几何校验、线段/圆弧碰撞、
+模态解析、版本不可变、旧报告不变、非法输入不落报告、可选全程最小净间隙、多刀半径
+映射、多刀执行事件轨迹与批量审查等场景；`test_uploads.py` 覆盖长 G-code 可恢复上传：
+会话创建固定并校验审查参数（含多刀/净间隙、版本快照独立）、乱序到块与已收序号查询、
+空块/恰好 64 KiB 边界/单块超限 413/会话总量 8 MiB 超限 413/非法 UTF-8 422、
+同号同内容重传原回执与同号异内容 409、缺块（含多出块）409 不落报告且可补齐、
+摘要不符 422 与解析失败 422 不留报告且会话保持 open、成功完成结果与单项审查逐字段一致
+（行号按拼接原文）、相同完成重放/并发返回同一报告与不同声明 409、完成后拒绝新块、
+正整数块数校验、UTF-8 多字节切块边界，以及会话与块跨重启（同库文件）保留。

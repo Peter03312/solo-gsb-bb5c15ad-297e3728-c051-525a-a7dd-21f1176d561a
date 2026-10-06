@@ -249,6 +249,67 @@ def main() -> None:
         print("  failed item:", f["index"], f["task_id"], f["error"])
     assert [f["task_id"] for f in err["failed_items"]] == ["bad-gcode"]
 
+    # 12. 长 G-code 可恢复上传会话：网络不稳时按 UTF-8 字节边界切块，
+    #     序号从 0 起、可乱序、可同号重传；创建时固定禁区版本/初始刀尖/刀半径
+    #     及可选多刀/最小净间隙参数，完成时声明块数与拼接 SHA-256。
+    long_gcode = (
+        "G21 G90 G17\n"
+        "G1 X-5 Y5 Z0\n"
+        "G1 X15 Y5 Z0\n"   # 横穿禁区 => 碰撞
+    )
+    raw = long_gcode.encode("utf-8")
+    cut = len(raw) // 2
+    parts = [raw[:cut], raw[cut:]]  # 必须在 UTF-8 字符边界切分
+
+    up = c.post("/uploads", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 5.0, 0.0],
+        "tool_radius": 0.0,
+        "include_min_clearance": True,
+    })
+    up.raise_for_status()
+    session_id = up.json()["session_id"]
+    print("upload session:", session_id, "limits:",
+          up.json()["max_chunk_bytes"], up.json()["max_session_bytes"])
+
+    # 乱序提交（先发 1 再发 0），请求体为块的 UTF-8 明文字节
+    r = c.put(f"/uploads/{session_id}/chunks/1", content=parts[1])
+    r.raise_for_status()
+    r = c.put(f"/uploads/{session_id}/chunks/0", content=parts[0])
+    r.raise_for_status()
+    print("received seqs:", r.json()["received_seqs"],
+          "bytes:", r.json()["total_bytes"])
+
+    # 网络重发：同号同内容返回原回执（resubmitted=true，不重复入库）
+    replay = c.put(f"/uploads/{session_id}/chunks/0", content=parts[0])
+    assert replay.json()["resubmitted"] is True
+
+    # 查询已收序号，决定还要补传哪些块
+    status = c.get(f"/uploads/{session_id}").json()
+    assert status["received_seqs"] == [0, 1]
+
+    # 完成：声明正整数块数与拼接文本 SHA-256（201，生成不可变报告）
+    import hashlib
+    done = c.post(f"/uploads/{session_id}/complete", json={
+        "block_count": len(parts),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    })
+    done.raise_for_status()
+    body = done.json()
+    print("upload complete:", body["conclusion"],
+          "line:", body["collision_line_no"], "report:", body["report_id"])
+    assert body["collision_line_no"] == 3
+
+    # 完成请求重放：200，同一报告；不同声明 409；完成后拒绝新块
+    again = c.post(f"/uploads/{session_id}/complete", json={
+        "block_count": len(parts),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    })
+    assert again.status_code == 200
+    assert again.json()["report_id"] == body["report_id"]
+    assert c.put(f"/uploads/{session_id}/chunks/9", content=b"x").status_code == 409
+    print("upload replay identical, session sealed")
+
 
 if __name__ == "__main__":
     main()

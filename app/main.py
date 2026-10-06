@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, inspect, select, text
+from sqlalchemy import func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -17,22 +18,29 @@ from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
-from .models import Batch, Report, ZoneVersion
+from .models import Batch, Report, UploadChunk, UploadSession, ZoneVersion
 from .schemas import (BatchItemResult, BatchReviewRequest, BatchReviewResponse,
-                      MinClearanceOut, ReviewRequest, ReviewResponse,
-                      TraceEventOut, ZoneCreate, ZoneDetailOut, ZoneOut,
-                      ZoneVersionCreate, ZoneVersionOut)
+                      MAX_CHUNK_BYTES, MAX_SESSION_BYTES, MinClearanceOut,
+                      ReviewParamsBase, ReviewRequest, ReviewResponse,
+                      TraceEventOut, UploadChunkReceipt, UploadCompleteRequest,
+                      UploadCompleteResponse, UploadSessionCreate,
+                      UploadSessionOut, UploadSessionStatus, ZoneCreate,
+                      ZoneDetailOut, ZoneOut, ZoneVersionCreate,
+                      ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.4.0",
+    version="1.5.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
                 "可选计算全程最小水平净间隙（include_min_clearance），"
                 "可选多刀半径映射（tool_radii：刀号到毫米半径），"
                 "多刀模式随报告固化可回看的执行事件轨迹（execution_trace）；"
                 "支持一次提交 1～50 项有序任务的批量审查（/reviews/batch，"
-                "batch_id 幂等，整批同一事务）。",
+                "batch_id 幂等，整批同一事务）；"
+                "支持长 G-code 可恢复分片上传会话（/uploads：创建时固定审查参数，"
+                "从 0 起序号提交 UTF-8 文本块，乱序可达、断点重传，"
+                "完成时拼接校验并按既有单项审查口径生成不可变报告）。",
 )
 
 
@@ -208,13 +216,18 @@ def _load_zones(db: Session, refs) -> tuple[list[Zone], dict[str, int], dict[int
     return zones, used, version_ids
 
 
-def _build_review(db: Session, payload: ReviewRequest) -> ReviewResponse:
+def _build_review(db: Session, payload: ReviewParamsBase,
+                  gcode: str | None = None) -> ReviewResponse:
     """校验并计算单项审查，构造 Report（加入会话并 flush，不 commit）。
+
+    payload 为审查参数（单项请求或上传会话固定参数，同一校验口径）；
+    gcode 对上传会话由调用方传入拼接文本，单项请求取 payload.gcode。
 
     调用方决定提交时机：单项端点立即提交；批量端点在同一事务中
     先跑完整批再统一提交，任一项抛错即整体回滚、不留任何报告。
     非法输入抛 HTTPException / GeometryError。
     """
+    gcode = payload.gcode if gcode is None else gcode  # type: ignore[attr-defined]
     if payload.tool_radius < 0:
         raise HTTPException(status_code=422, detail="刀具半径不得为负")
 
@@ -228,12 +241,12 @@ def _build_review(db: Session, payload: ReviewRequest) -> ReviewResponse:
     try:
         if multi_tool:
             parsed = parse_gcode(
-                payload.gcode, tuple(payload.start),  # type: ignore[arg-type]
+                gcode, tuple(payload.start),  # type: ignore[arg-type]
                 tool_radius_map=tool_map,
                 initial_tool_radius=float(payload.tool_radius))
         else:
             parsed = parse_gcode(
-                payload.gcode, tuple(payload.start))  # type: ignore[arg-type]
+                gcode, tuple(payload.start))  # type: ignore[arg-type]
     except GCodeError as exc:
         raise HTTPException(status_code=422, detail={
             "error": "invalid_gcode",
@@ -248,7 +261,7 @@ def _build_review(db: Session, payload: ReviewRequest) -> ReviewResponse:
         "start_position_mm": list(payload.start),
         "tool_radius_mm": payload.tool_radius,
         "final_position_mm": list(parsed.final_position),
-        "gcode_sha256": _sha(payload.gcode),
+        "gcode_sha256": _sha(gcode),
         "include_min_clearance": bool(payload.include_min_clearance),
     }
     if multi_tool:
@@ -456,6 +469,305 @@ def review_batch(payload: BatchReviewRequest,
 
     return BatchReviewResponse(batch_id=payload.batch_id,
                                item_count=len(results), results=results)
+
+
+# ---------- 长 G-code 可恢复上传会话 ----------
+
+async def _raw_body(request: Request) -> bytes:
+    """读取原始请求体（块内容以 UTF-8 明文裸传，非 JSON）。"""
+    return await request.body()
+
+
+def _lock_session(db: Session, session_id: str) -> UploadSession | None:
+    """按外部会话标识取会话并加行锁（完成/写块串行化，数据库无关）。"""
+    sess = db.scalar(select(UploadSession).where(
+        UploadSession.session_id == session_id))
+    if sess is None:
+        return None
+    if db.bind.dialect.name == "postgresql":
+        db.scalar(select(UploadSession).where(
+            UploadSession.id == sess.id).with_for_update())
+    return sess
+
+
+def _session_params(payload: ReviewParamsBase) -> dict:
+    """会话固定审查参数的规范化 JSON 快照（与单项审查同一校验模型）。"""
+    data = payload.model_dump(mode="json")
+    data.pop("gcode", None)  # 基类无此字段；防御性剔除
+    return data
+
+
+def _params_to_request(params: dict, gcode: str) -> ReviewRequest:
+    """把会话固定参数快照还原为审查参数对象（与 POST /reviews 同模型）。"""
+    return ReviewRequest(**dict(params, gcode=gcode))
+
+
+def _session_param_view(params: dict) -> dict:
+    """固定参数快照的外部视图（tool_radii 键还原为 int）。"""
+    view = dict(params)
+    if view.get("tool_radii") is not None:
+        view["tool_radii"] = {int(k): v for k, v in view["tool_radii"].items()}
+    return view
+
+
+def _received(db: Session, sess: UploadSession) -> tuple[list[int], int]:
+    rows = db.scalars(select(UploadChunk.seq).where(
+        UploadChunk.session_id == sess.id).order_by(UploadChunk.seq)).all()
+    return list(rows), int(sess.total_bytes or 0)
+
+
+def _chunk_receipt(sess: UploadSession, chunk: UploadChunk,
+                   seqs: list[int], total_bytes: int,
+                   resubmitted: bool) -> UploadChunkReceipt:
+    return UploadChunkReceipt(
+        session_id=sess.session_id, seq=chunk.seq,
+        size_bytes=chunk.size_bytes, chunk_sha256=chunk.content_sha256,
+        received_seqs=seqs, received_count=len(seqs),
+        total_bytes=total_bytes, resubmitted=resubmitted)
+
+
+@app.post("/uploads", response_model=UploadSessionOut, status_code=201,
+          summary="创建长 G-code 可恢复上传会话（固定审查参数，返回会话标识）")
+def create_upload(payload: UploadSessionCreate,
+                  db: Session = Depends(get_db)) -> UploadSessionOut:
+    # 创建时即固定并校验禁区编号+明确版本：引用不存在直接 404/422，
+    # 与单项审查同一口径（几何在完成时仍随 _build_review 防御性再校验）
+    _load_zones(db, payload.zones)
+
+    session_id = uuid.uuid4().hex
+    sess = UploadSession(session_id=session_id, status="open",
+                         params=_session_params(payload), total_bytes=0)
+    db.add(sess)
+    db.commit()
+    db.refresh(sess)
+
+    view = _session_param_view(sess.params)
+    return UploadSessionOut(
+        session_id=sess.session_id, status=sess.status,
+        zones=view["zones"], start=tuple(view["start"]),
+        tool_radius=view["tool_radius"],
+        include_min_clearance=bool(view.get("include_min_clearance", False)),
+        tool_radii=view.get("tool_radii"),
+        max_chunk_bytes=MAX_CHUNK_BYTES, max_session_bytes=MAX_SESSION_BYTES,
+        created_at=sess.created_at)
+
+
+@app.put("/uploads/{session_id}/chunks/{seq}",
+         response_model=UploadChunkReceipt,
+         summary="提交一个 UTF-8 文本块（序号从 0 起，可乱序，可重传）")
+def put_chunk(session_id: str, seq: int,
+              body: bytes = Depends(_raw_body),
+              db: Session = Depends(get_db)) -> UploadChunkReceipt:
+    if seq < 0:
+        raise HTTPException(status_code=404, detail="块序号必须从 0 开始")
+    if len(body) > MAX_CHUNK_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "error": "chunk_too_large",
+            "max_chunk_bytes": MAX_CHUNK_BYTES,
+            "size_bytes": len(body),
+            "message": f"单块不得超过 {MAX_CHUNK_BYTES} 字节（64 KiB）",
+        })
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_utf8",
+            "seq": seq,
+            "message": f"块 {seq} 不是合法 UTF-8 文本：{exc.reason}",
+        })
+
+    sess = _lock_session(db, session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail=f"上传会话 {session_id} 不存在")
+    if sess.status == "completed":
+        raise HTTPException(status_code=409, detail={
+            "error": "session_completed",
+            "session_id": session_id,
+            "message": "会话已完成并生成不可变报告，拒绝新块",
+        })
+
+    chunk_hash = hashlib.sha256(body).hexdigest()
+    existing = db.scalar(select(UploadChunk).where(
+        UploadChunk.session_id == sess.id, UploadChunk.seq == seq))
+    if existing is not None:
+        # 同号重传：内容一致返回原回执；同号异内容冲突，不覆盖原块
+        if existing.content != text:
+            raise HTTPException(status_code=409, detail={
+                "error": "chunk_conflict",
+                "session_id": session_id, "seq": seq,
+                "message": f"块 {seq} 已存在且内容不同",
+            })
+        seqs, total_bytes = _received(db, sess)
+        return _chunk_receipt(sess, existing, seqs, total_bytes,
+                              resubmitted=True)
+
+    # 会话总量上限（按 UTF-8 字节累计）
+    new_total = int(sess.total_bytes or 0) + len(body)
+    if new_total > MAX_SESSION_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "error": "session_too_large",
+            "max_session_bytes": MAX_SESSION_BYTES,
+            "total_bytes": new_total,
+            "message": f"会话总量不得超过 {MAX_SESSION_BYTES} 字节（8 MiB）",
+        })
+
+    chunk = UploadChunk(session_id=sess.id, seq=seq, content=text,
+                        size_bytes=len(body), content_sha256=chunk_hash)
+    db.add(chunk)
+    sess.total_bytes = new_total
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发同序号：唯一约束兜底，回读按重放/冲突判定
+        db.rollback()
+        sess = _lock_session(db, session_id)
+        if sess is None:
+            raise HTTPException(status_code=404,
+                                detail=f"上传会话 {session_id} 不存在")
+        if sess.status == "completed":
+            raise HTTPException(status_code=409, detail={
+                "error": "session_completed", "session_id": session_id,
+                "message": "会话已完成并生成不可变报告，拒绝新块"})
+        winner = db.scalar(select(UploadChunk).where(
+            UploadChunk.session_id == sess.id, UploadChunk.seq == seq))
+        if winner is not None and winner.content != text:
+            raise HTTPException(status_code=409, detail={
+                "error": "chunk_conflict", "session_id": session_id, "seq": seq,
+                "message": f"块 {seq} 已存在且内容不同"})
+        seqs, total_bytes = _received(db, sess)
+        return _chunk_receipt(sess, winner, seqs, total_bytes,
+                              resubmitted=True)
+
+    db.refresh(chunk)
+    seqs, total_bytes = _received(db, sess)
+    return _chunk_receipt(sess, chunk, seqs, total_bytes, resubmitted=False)
+
+
+@app.get("/uploads/{session_id}", response_model=UploadSessionStatus,
+         summary="查询上传会话状态（已收序号、字节量与完成状态）")
+def get_upload(session_id: str,
+               db: Session = Depends(get_db)) -> UploadSessionStatus:
+    sess = db.scalar(select(UploadSession).where(
+        UploadSession.session_id == session_id))
+    if sess is None:
+        raise HTTPException(status_code=404, detail=f"上传会话 {session_id} 不存在")
+    view = _session_param_view(sess.params)
+    seqs, total_bytes = _received(db, sess)
+    report_id = None
+    if sess.completed_result is not None:
+        report_id = sess.completed_result.get("report_id")
+    return UploadSessionStatus(
+        session_id=sess.session_id, status=sess.status,
+        zones=view["zones"], start=tuple(view["start"]),
+        tool_radius=view["tool_radius"],
+        include_min_clearance=bool(view.get("include_min_clearance", False)),
+        tool_radii=view.get("tool_radii"),
+        received_seqs=seqs, received_count=len(seqs), total_bytes=total_bytes,
+        max_chunk_bytes=MAX_CHUNK_BYTES, max_session_bytes=MAX_SESSION_BYTES,
+        block_count=sess.block_count, content_sha256=sess.content_sha256,
+        report_id=report_id, created_at=sess.created_at,
+        completed_at=sess.completed_at)
+
+
+@app.post("/uploads/{session_id}/complete",
+          response_model=UploadCompleteResponse,
+          summary="完成上传会话：校验齐全性/摘要并生成不可变审查报告")
+def complete_upload(session_id: str, payload: UploadCompleteRequest,
+                    db: Session = Depends(get_db)):
+    sess = _lock_session(db, session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail=f"上传会话 {session_id} 不存在")
+
+    # 已完成：相同声明（块数+摘要）重放同一报告；不同声明冲突
+    if sess.status == "completed":
+        same = (sess.block_count == payload.block_count
+                and (sess.content_sha256 or "").lower() == payload.sha256)
+        if not same:
+            raise HTTPException(status_code=409, detail={
+                "error": "completion_conflict",
+                "session_id": session_id,
+                "message": "会话已完成且完成声明（块数/摘要）不同，拒绝重放",
+            })
+        return JSONResponse(status_code=200,
+                            content=sess.completed_result)
+
+    chunks = db.scalars(select(UploadChunk).where(
+        UploadChunk.session_id == sess.id).order_by(UploadChunk.seq)).all()
+    seqs = [c.seq for c in chunks]
+    expected = list(range(payload.block_count))
+
+    # 缺块（0..block_count-1 不齐全）=> 409，不留报告，会话保持 open
+    if seqs != expected:
+        present = set(seqs)
+        missing = [i for i in expected if i not in present]
+        extra = [i for i in seqs if i >= payload.block_count]
+        raise HTTPException(status_code=409, detail={
+            "error": "blocks_incomplete",
+            "session_id": session_id,
+            "block_count": payload.block_count,
+            "missing_seqs": missing,
+            "extra_seqs": extra,
+            "message": (f"块 0..{payload.block_count - 1} 不齐全，"
+                        f"缺少 {len(missing)} 块"),
+        })
+
+    # 总量超限（8 MiB）：写块路径已拦截，此处对历史/边界数据兜底
+    total_bytes = sum(c.size_bytes for c in chunks)
+    if total_bytes > MAX_SESSION_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "error": "session_too_large",
+            "max_session_bytes": MAX_SESSION_BYTES,
+            "total_bytes": total_bytes,
+            "message": f"会话总量不得超过 {MAX_SESSION_BYTES} 字节（8 MiB）",
+        })
+
+    gcode = "".join(c.content for c in chunks)
+    digest = hashlib.sha256(gcode.encode("utf-8")).hexdigest()
+    # 摘要不符 => 422，不留报告，会话保持 open（可修正声明后重试）
+    if digest != payload.sha256:
+        raise HTTPException(status_code=422, detail={
+            "error": "sha256_mismatch",
+            "session_id": session_id,
+            "expected_sha256": payload.sha256,
+            "actual_sha256": digest,
+            "message": "拼接后文本 SHA-256 与声明不符",
+        })
+
+    # 既有单项审查口径（解析失败/几何/参数非法在此抛 422，不留报告）。
+    # 此处仅 flush 报告（未提交）：随后由条件 UPDATE 原子占位完成权，
+    # 占位失败则回滚掉这份报告，保证并发完成只产生一份报告。
+    review_req = _params_to_request(sess.params, gcode)
+    resp = _build_review(db, review_req, gcode=gcode)
+
+    result = resp.model_dump(mode="json")
+    result = {"session_id": sess.session_id, **result}
+
+    # 原子置完成：仅在仍为 open 时写入完成声明与结果快照（数据库无关）。
+    # PostgreSQL 下此前已持有该行行锁，并发完成者只会在锁后看到 completed。
+    upd = db.execute(update(UploadSession).where(
+        UploadSession.id == sess.id,
+        UploadSession.status == "open").values(
+            status="completed",
+            block_count=payload.block_count,
+            content_sha256=digest,
+            completed_result=result,
+            completed_at=models._utcnow()))
+    if upd.rowcount == 0:
+        # 并发下另一请求已完成：回滚本次 flush 的报告，按首次结果重放/冲突
+        db.rollback()
+        winner = _lock_session(db, session_id)
+        if winner is not None and winner.status == "completed":
+            same = (winner.block_count == payload.block_count
+                    and (winner.content_sha256 or "").lower() == payload.sha256)
+            if same:
+                return JSONResponse(status_code=200,
+                                    content=winner.completed_result)
+        raise HTTPException(status_code=409, detail={
+            "error": "completion_conflict", "session_id": session_id,
+            "message": "会话已被并发完成且声明不同"})
+
+    db.commit()
+    return JSONResponse(status_code=201, content=result)
 
 
 @app.get("/reports/{report_id}", summary="查询不可变审查报告")
